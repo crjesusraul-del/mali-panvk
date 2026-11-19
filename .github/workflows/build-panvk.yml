@@ -30,7 +30,7 @@ jobs:
           ndk-version: r29
           add-to-path: false
 
-      - name: Patch CSF kbase ioctls & scoreboard mask for Mali-G610 / Dimensity 7030
+      - name: Patch CSF kbase ioctls, scoreboard mask & exec BOs for Mali-G610 / Dimensity 7030
         run: |
           python3 - <<'PY'
           from pathlib import Path
@@ -226,8 +226,53 @@ jobs:
           assert old_sb in src, "Expected scoreboard wait mask block not found"
           src = src.replace(old_sb, new_sb, 1)
 
+          # 4a. MEM_EXEC_INIT antes de MEM_JIT_INIT en contexto CSF
+          old_exec_init = (
+              "      if (vc.major == 1) {\n"
+              "         struct kbase_ioctl_mem_jit_init jit = {\n"
+              "            .va_pages = KBASE_CSF_JIT_VA_PAGES,\n"
+              "            .max_allocations = 255,\n"
+              "            .phys_pages = KBASE_CSF_JIT_VA_PAGES,\n"
+              "         };\n"
+              "         if (pan_kmod_ioctl(fd, KBASE_IOCTL_MEM_JIT_INIT, &jit))\n"
+              '            mesa_logw("kbase: MEM_JIT_INIT failed (err=%d); no tiler heap", errno);\n'
+              "      }\n"
+              "      if (pan_kmod_ioctl(fd, KBASE_IOCTL_MEM_EXEC_INIT, &ei))\n"
+              '         mesa_logw("kbase: MEM_EXEC_INIT failed (err=%d); executable BOs will be SAME_VA", errno);'
+          )
+          new_exec_init = (
+              "      if (pan_kmod_ioctl(fd, KBASE_IOCTL_MEM_EXEC_INIT, &ei))\n"
+              '         mesa_logw("kbase: MEM_EXEC_INIT failed (err=%d); executable BOs will be SAME_VA", errno);\n'
+              "      if (vc.major == 1) {\n"
+              "         struct kbase_ioctl_mem_jit_init jit = {\n"
+              "            .va_pages = KBASE_CSF_JIT_VA_PAGES,\n"
+              "            .max_allocations = 255,\n"
+              "            .phys_pages = KBASE_CSF_JIT_VA_PAGES,\n"
+              "         };\n"
+              "         if (pan_kmod_ioctl(fd, KBASE_IOCTL_MEM_JIT_INIT, &jit))\n"
+              '            mesa_logw("kbase: MEM_JIT_INIT failed (err=%d); no tiler heap", errno);\n'
+              "      }"
+          )
+          assert old_exec_init in src, "Expected MEM_EXEC_INIT block not found"
+          src = src.replace(old_exec_init, new_exec_init, 1)
+
+          # 4b. Si el kernel degrada un BO ejecutable a SAME_VA (BASE_MEM_NEED_MMAP), mapear su anchor
+          old_bo_exec = (
+              "   bo->exec = exec;\n"
+              "   bo->anchor = NULL;\n\n"
+              "   if (exec) {"
+          )
+          new_bo_exec = (
+              "   const bool need_mmap = (req.out.flags & BASE_MEM_NEED_MMAP) != 0;\n"
+              "   bo->exec = exec && !need_mmap;\n"
+              "   bo->anchor = NULL;\n\n"
+              "   if (bo->exec) {"
+          )
+          assert old_bo_exec in src, "Expected kbase_kmod_bo_alloc exec block not found"
+          src = src.replace(old_bo_exec, new_bo_exec, 1)
+
           p.write_text(src)
-          print("Successfully patched kbase_kmod.c (all 3 patches)")
+          print("Successfully patched kbase_kmod.c (all 4 patches)")
           PY
 
       - name: Build Android PanVK driver & package zip
