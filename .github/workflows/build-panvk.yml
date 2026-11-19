@@ -30,204 +30,96 @@ jobs:
           ndk-version: r29
           add-to-path: false
 
-      - name: Patch CSF kbase ioctls, scoreboard mask, exec BOs & sync wait for Mali-G610 / Dimensity 7030
+      - name: Patch CSF kbase for Mali-G610 / Dimensity 7030
         run: |
           python3 - <<'PY'
           from pathlib import Path
 
           p = Path("src/panfrost/lib/kmod/kbase_kmod.c")
-          src = p.read_text()
+          s = p.read_text()
 
-          # 1. Fallback para CS_TILER_HEAP_INIT (24B -> 16B)
-          old_ioctl = (
+          def sub(old, new):
+              global s
+              assert s.count(old) == 1, f"Match count {s.count(old)} for {old[:50]!r}"
+              s = s.replace(old, new, 1)
+
+          # 1. CS_TILER_HEAP_INIT (24B -> 16B v1.13)
+          sub(
               "#define KBASE_IOCTL_CS_TILER_HEAP_INIT                                                            \\\n"
-              "   _IOWR(KBASE_IOCTL_TYPE, 48, union kbase_ioctl_cs_tiler_heap_init)"
-          )
-          new_ioctl = (
+              "   _IOWR(KBASE_IOCTL_TYPE, 48, union kbase_ioctl_cs_tiler_heap_init)",
               "union kbase_ioctl_cs_tiler_heap_init_v1_13 {\n"
-              "   struct {\n"
-              "      uint32_t chunk_size;\n"
-              "      uint32_t initial_chunks;\n"
-              "      uint32_t max_chunks;\n"
-              "      uint16_t target_in_flight;\n"
-              "      uint8_t group_id;\n"
-              "      uint8_t padding;\n"
-              "   } in;\n"
-              "   struct {\n"
-              "      uint64_t gpu_heap_va;\n"
-              "      uint64_t first_chunk_va;\n"
-              "   } out;\n"
-              "};\n\n"
-              "#define KBASE_IOCTL_CS_TILER_HEAP_INIT_V1_13                                                      \\\n"
-              "   _IOWR(KBASE_IOCTL_TYPE, 48, union kbase_ioctl_cs_tiler_heap_init_v1_13)\n\n"
-              + old_ioctl
+              "   struct { uint32_t chunk_size, initial_chunks, max_chunks; uint16_t target_in_flight; uint8_t group_id, padding; } in;\n"
+              "   struct { uint64_t gpu_heap_va, first_chunk_va; } out;\n"
+              "};\n"
+              "#define KBASE_IOCTL_CS_TILER_HEAP_INIT_V1_13 _IOWR(KBASE_IOCTL_TYPE, 48, union kbase_ioctl_cs_tiler_heap_init_v1_13)\n"
+              "#define KBASE_IOCTL_CS_TILER_HEAP_INIT _IOWR(KBASE_IOCTL_TYPE, 48, union kbase_ioctl_cs_tiler_heap_init)"
           )
-          assert old_ioctl in src, "Expected KBASE_IOCTL_CS_TILER_HEAP_INIT block not found"
-          src = src.replace(old_ioctl, new_ioctl, 1)
-
-          old_func = (
+          sub(
               "   if (pan_kmod_ioctl(dev->fd, KBASE_IOCTL_CS_TILER_HEAP_INIT, &req)) {\n"
               '      mesa_loge("kbase: CS_TILER_HEAP_INIT failed (err=%d)", errno);\n'
               "      return false;\n"
-              "   }\n"
-              "   *heap_ctx_va = req.out.gpu_heap_va;\n"
-              "   *first_chunk_va = req.out.first_chunk_va;"
-          )
-          new_func = (
+              "   }",
               "   if (pan_kmod_ioctl(dev->fd, KBASE_IOCTL_CS_TILER_HEAP_INIT, &req)) {\n"
               "      if (errno == ENOTTY) {\n"
-              "         union kbase_ioctl_cs_tiler_heap_init_v1_13 req_legacy = {\n"
-              "            .in = {\n"
-              "               .chunk_size = chunk_size,\n"
-              "               .initial_chunks = initial_chunks,\n"
-              "               .max_chunks = max_chunks,\n"
-              "               .target_in_flight = target_in_flight,\n"
-              "            },\n"
-              "         };\n"
-              "         if (pan_kmod_ioctl(dev->fd, KBASE_IOCTL_CS_TILER_HEAP_INIT_V1_13, &req_legacy)) {\n"
-              '            mesa_loge("kbase: CS_TILER_HEAP_INIT (legacy) failed (err=%d)", errno);\n'
-              "            return false;\n"
+              "         union kbase_ioctl_cs_tiler_heap_init_v1_13 r13 = {.in = {\n"
+              "            .chunk_size = chunk_size, .initial_chunks = initial_chunks,\n"
+              "            .max_chunks = max_chunks, .target_in_flight = target_in_flight}};\n"
+              "         if (pan_kmod_ioctl(dev->fd, KBASE_IOCTL_CS_TILER_HEAP_INIT_V1_13, &r13)) {\n"
+              '            mesa_loge("kbase: CS_TILER_HEAP_INIT (legacy) failed (err=%d)", errno); return false;\n'
               "         }\n"
-              "         *heap_ctx_va = req_legacy.out.gpu_heap_va;\n"
-              "         *first_chunk_va = req_legacy.out.first_chunk_va;\n"
-              "         return true;\n"
+              "         *heap_ctx_va = r13.out.gpu_heap_va; *first_chunk_va = r13.out.first_chunk_va; return true;\n"
               "      }\n"
-              '      mesa_loge("kbase: CS_TILER_HEAP_INIT failed (err=%d)", errno);\n'
-              "      return false;\n"
-              "   }\n"
-              "   *heap_ctx_va = req.out.gpu_heap_va;\n"
-              "   *first_chunk_va = req.out.first_chunk_va;"
+              '      mesa_loge("kbase: CS_TILER_HEAP_INIT failed (err=%d)", errno); return false;\n'
+              "   }"
           )
-          assert old_func in src, "Expected CS_TILER_HEAP_INIT call block not found"
-          src = src.replace(old_func, new_func, 1)
 
-          # 2. Fallback para CS_QUEUE_GROUP_CREATE (112B ioctl 58 -> 40B ioctl 58 -> 32B ioctl 42)
-          old_gc_ioctl = (
+          # 2. CS_QUEUE_GROUP_CREATE (112B ioctl 58 -> 40B ioctl 58 -> 32B ioctl 42)
+          sub(
               "#define KBASE_IOCTL_CS_QUEUE_GROUP_CREATE                                                         \\\n"
-              "   _IOWR(KBASE_IOCTL_TYPE, 58, union kbase_ioctl_cs_queue_group_create)"
-          )
-          new_gc_ioctl = (
+              "   _IOWR(KBASE_IOCTL_TYPE, 58, union kbase_ioctl_cs_queue_group_create)",
               "union kbase_ioctl_cs_queue_group_create_v40 {\n"
-              "   struct {\n"
-              "      uint64_t tiler_mask;\n"
-              "      uint64_t fragment_mask;\n"
-              "      uint64_t compute_mask;\n"
-              "      uint8_t cs_min;\n"
-              "      uint8_t priority;\n"
-              "      uint8_t tiler_max;\n"
-              "      uint8_t fragment_max;\n"
-              "      uint8_t compute_max;\n"
-              "      uint8_t csi_handlers;\n"
-              "      uint8_t padding[2];\n"
-              "      uint64_t reserved;\n"
-              "   } in;\n"
-              "   struct {\n"
-              "      uint8_t group_handle;\n"
-              "      uint8_t padding[3];\n"
-              "      uint32_t group_uid;\n"
-              "   } out;\n"
-              "};\n\n"
+              "   struct { uint64_t tiler_mask, fragment_mask, compute_mask; uint8_t cs_min, priority, tiler_max, fragment_max, compute_max, csi_handlers, padding[2]; uint64_t reserved; } in;\n"
+              "   struct { uint8_t group_handle, padding[3]; uint32_t group_uid; } out;\n"
+              "};\n"
               "union kbase_ioctl_cs_queue_group_create_1_6 {\n"
-              "   struct {\n"
-              "      uint64_t tiler_mask;\n"
-              "      uint64_t fragment_mask;\n"
-              "      uint64_t compute_mask;\n"
-              "      uint8_t cs_min;\n"
-              "      uint8_t priority;\n"
-              "      uint8_t tiler_max;\n"
-              "      uint8_t fragment_max;\n"
-              "      uint8_t compute_max;\n"
-              "      uint8_t padding[3];\n"
-              "   } in;\n"
-              "   struct {\n"
-              "      uint8_t group_handle;\n"
-              "      uint8_t padding[3];\n"
-              "      uint32_t group_uid;\n"
-              "   } out;\n"
-              "};\n\n"
-              "#define KBASE_IOCTL_CS_QUEUE_GROUP_CREATE_V40                                                     \\\n"
-              "   _IOWR(KBASE_IOCTL_TYPE, 58, union kbase_ioctl_cs_queue_group_create_v40)\n"
-              "#define KBASE_IOCTL_CS_QUEUE_GROUP_CREATE_1_6                                                     \\\n"
-              "   _IOWR(KBASE_IOCTL_TYPE, 42, union kbase_ioctl_cs_queue_group_create_1_6)\n\n"
-              + old_gc_ioctl
+              "   struct { uint64_t tiler_mask, fragment_mask, compute_mask; uint8_t cs_min, priority, tiler_max, fragment_max, compute_max, padding[3]; } in;\n"
+              "   struct { uint8_t group_handle, padding[3]; uint32_t group_uid; } out;\n"
+              "};\n"
+              "#define KBASE_IOCTL_CS_QUEUE_GROUP_CREATE_V40 _IOWR(KBASE_IOCTL_TYPE, 58, union kbase_ioctl_cs_queue_group_create_v40)\n"
+              "#define KBASE_IOCTL_CS_QUEUE_GROUP_CREATE_1_6 _IOWR(KBASE_IOCTL_TYPE, 42, union kbase_ioctl_cs_queue_group_create_1_6)\n"
+              "#define KBASE_IOCTL_CS_QUEUE_GROUP_CREATE _IOWR(KBASE_IOCTL_TYPE, 58, union kbase_ioctl_cs_queue_group_create)"
           )
-          assert old_gc_ioctl in src, "Expected KBASE_IOCTL_CS_QUEUE_GROUP_CREATE block not found"
-          src = src.replace(old_gc_ioctl, new_gc_ioctl, 1)
-
-          old_gc_call = (
+          sub(
               "   if (pan_kmod_ioctl(dev->fd, KBASE_IOCTL_CS_QUEUE_GROUP_CREATE, &gc)) {\n"
               '      mesa_loge("kbase: CS_QUEUE_GROUP_CREATE failed (err=%d)", errno);\n'
               "      goto err_free_seq;\n"
               "   }\n"
-              "   g->handle = gc.out.group_handle;"
-          )
-          new_gc_call = (
-              "   uint8_t group_handle = 0;\n"
+              "   g->handle = gc.out.group_handle;",
+              "   uint8_t gh = 0;\n"
               "   if (pan_kmod_ioctl(dev->fd, KBASE_IOCTL_CS_QUEUE_GROUP_CREATE, &gc)) {\n"
               "      if (errno == ENOTTY) {\n"
-              "         union kbase_ioctl_cs_queue_group_create_v40 gc40 = {\n"
-              "            .in = {\n"
-              "               .tiler_mask = 1,\n"
-              "               .fragment_mask = fragment_mask,\n"
-              "               .compute_mask = compute_mask,\n"
-              "               .cs_min = nr_queues,\n"
-              "               .priority = priority,\n"
-              "               .tiler_max = 1,\n"
-              "               .fragment_max = max_fragment,\n"
-              "               .compute_max = max_compute,\n"
-              "            },\n"
-              "         };\n"
-              "         union kbase_ioctl_cs_queue_group_create_1_6 gc32 = {\n"
-              "            .in = {\n"
-              "               .tiler_mask = 1,\n"
-              "               .fragment_mask = fragment_mask,\n"
-              "               .compute_mask = compute_mask,\n"
-              "               .cs_min = nr_queues,\n"
-              "               .priority = priority,\n"
-              "               .tiler_max = 1,\n"
-              "               .fragment_max = max_fragment,\n"
-              "               .compute_max = max_compute,\n"
-              "            },\n"
-              "         };\n"
-              "         if (!pan_kmod_ioctl(dev->fd, KBASE_IOCTL_CS_QUEUE_GROUP_CREATE_V40, &gc40)) {\n"
-              "            group_handle = gc40.out.group_handle;\n"
-              "         } else if (errno == ENOTTY && !pan_kmod_ioctl(dev->fd, KBASE_IOCTL_CS_QUEUE_GROUP_CREATE_1_6, &gc32)) {\n"
-              "            group_handle = gc32.out.group_handle;\n"
-              "         } else {\n"
-              '            mesa_loge("kbase: CS_QUEUE_GROUP_CREATE (fallback) failed (err=%d)", errno);\n'
-              "            goto err_free_seq;\n"
-              "         }\n"
-              "      } else {\n"
-              '         mesa_loge("kbase: CS_QUEUE_GROUP_CREATE failed (err=%d)", errno);\n'
-              "         goto err_free_seq;\n"
-              "      }\n"
-              "   } else {\n"
-              "      group_handle = gc.out.group_handle;\n"
-              "   }\n"
-              "   g->handle = group_handle;"
+              "         union kbase_ioctl_cs_queue_group_create_v40 g40 = {.in = {.tiler_mask = 1, .fragment_mask = fragment_mask, .compute_mask = compute_mask, .cs_min = nr_queues, .priority = priority, .tiler_max = 1, .fragment_max = max_fragment, .compute_max = max_compute}};\n"
+              "         union kbase_ioctl_cs_queue_group_create_1_6 g32 = {.in = {.tiler_mask = 1, .fragment_mask = fragment_mask, .compute_mask = compute_mask, .cs_min = nr_queues, .priority = priority, .tiler_max = 1, .fragment_max = max_fragment, .compute_max = max_compute}};\n"
+              "         if (!pan_kmod_ioctl(dev->fd, KBASE_IOCTL_CS_QUEUE_GROUP_CREATE_V40, &g40)) gh = g40.out.group_handle;\n"
+              "         else if (errno == ENOTTY && !pan_kmod_ioctl(dev->fd, KBASE_IOCTL_CS_QUEUE_GROUP_CREATE_1_6, &g32)) gh = g32.out.group_handle;\n"
+              '         else { mesa_loge("kbase: CS_QUEUE_GROUP_CREATE (fallback) failed (err=%d)", errno); goto err_free_seq; }\n'
+              '      } else { mesa_loge("kbase: CS_QUEUE_GROUP_CREATE failed (err=%d)", errno); goto err_free_seq; }\n'
+              "   } else gh = gc.out.group_handle;\n"
+              "   g->handle = gh;"
           )
-          assert old_gc_call in src, "Expected CS_QUEUE_GROUP_CREATE call block not found"
-          src = src.replace(old_gc_call, new_gc_call, 1)
 
-          # 3. Máscara real de scoreboards (8 slots = 0xff en G610, 16 slots = 0xffff en G720)
-          old_sb = (
-              "      kbase_csf_emit(r, cs_ins(CS_OP_MOVE32, V << 48));\n"
+          # 3. Scoreboards reales (0xff en G610, 0xffff en G720)
+          sub(
               "      kbase_csf_emit(r, cs_ins(CS_OP_FLUSH_CACHE2,\n"
               "                               (V << 40) | (0xffffull << 16) | (1u << 4) | 1u)); /* clean */\n"
-              "      kbase_csf_emit(r, cs_ins(CS_OP_WAIT, 0xffffull << 16));"
-          )
-          new_sb = (
+              "      kbase_csf_emit(r, cs_ins(CS_OP_WAIT, 0xffffull << 16));",
               "      const uint64_t sb_all = BITFIELD_MASK(MIN2(kdev->csif.scoreboard_slot_count, 16));\n"
-              "      kbase_csf_emit(r, cs_ins(CS_OP_MOVE32, V << 48));\n"
-              "      kbase_csf_emit(r, cs_ins(CS_OP_FLUSH_CACHE2,\n"
-              "                               (V << 40) | (sb_all << 16) | (1u << 4) | 1u)); /* clean */\n"
+              "      kbase_csf_emit(r, cs_ins(CS_OP_FLUSH_CACHE2, (V << 40) | (sb_all << 16) | (1u << 4) | 1u));\n"
               "      kbase_csf_emit(r, cs_ins(CS_OP_WAIT, sb_all << 16));"
           )
-          assert old_sb in src, "Expected scoreboard wait mask block not found"
-          src = src.replace(old_sb, new_sb, 1)
 
-          # 4a. MEM_EXEC_INIT antes de MEM_JIT_INIT en contexto CSF
-          old_exec_init = (
+          # 4. MEM_EXEC_INIT antes de MEM_JIT_INIT + BASE_MEM_NEED_MMAP
+          sub(
               "      if (vc.major == 1) {\n"
               "         struct kbase_ioctl_mem_jit_init jit = {\n"
               "            .va_pages = KBASE_CSF_JIT_VA_PAGES,\n"
@@ -238,154 +130,124 @@ jobs:
               '            mesa_logw("kbase: MEM_JIT_INIT failed (err=%d); no tiler heap", errno);\n'
               "      }\n"
               "      if (pan_kmod_ioctl(fd, KBASE_IOCTL_MEM_EXEC_INIT, &ei))\n"
-              '         mesa_logw("kbase: MEM_EXEC_INIT failed (err=%d); executable BOs will be SAME_VA", errno);'
-          )
-          new_exec_init = (
+              '         mesa_logw("kbase: MEM_EXEC_INIT failed (err=%d); executable BOs will be SAME_VA", errno);',
               "      if (pan_kmod_ioctl(fd, KBASE_IOCTL_MEM_EXEC_INIT, &ei))\n"
               '         mesa_logw("kbase: MEM_EXEC_INIT failed (err=%d); executable BOs will be SAME_VA", errno);\n'
               "      if (vc.major == 1) {\n"
-              "         struct kbase_ioctl_mem_jit_init jit = {\n"
-              "            .va_pages = KBASE_CSF_JIT_VA_PAGES,\n"
-              "            .max_allocations = 255,\n"
-              "            .phys_pages = KBASE_CSF_JIT_VA_PAGES,\n"
-              "         };\n"
+              "         struct kbase_ioctl_mem_jit_init jit = {.va_pages = KBASE_CSF_JIT_VA_PAGES, .max_allocations = 255, .phys_pages = KBASE_CSF_JIT_VA_PAGES};\n"
               "         if (pan_kmod_ioctl(fd, KBASE_IOCTL_MEM_JIT_INIT, &jit))\n"
               '            mesa_logw("kbase: MEM_JIT_INIT failed (err=%d); no tiler heap", errno);\n'
               "      }"
           )
-          assert old_exec_init in src, "Expected MEM_EXEC_INIT block not found"
-          src = src.replace(old_exec_init, new_exec_init, 1)
-
-          # 4b. Si el kernel degrada un BO ejecutable a SAME_VA (BASE_MEM_NEED_MMAP), mapear su anchor
-          old_bo_exec = (
-              "   bo->exec = exec;\n"
-              "   bo->anchor = NULL;\n\n"
-              "   if (exec) {"
-          )
-          new_bo_exec = (
+          sub(
+              "   bo->exec = exec;\n   bo->anchor = NULL;\n\n   if (exec) {",
               "   const bool need_mmap = (req.out.flags & BASE_MEM_NEED_MMAP) != 0;\n"
-              "   bo->exec = exec && !need_mmap;\n"
-              "   bo->anchor = NULL;\n\n"
-              "   if (bo->exec) {"
+              "   bo->exec = exec && !need_mmap;\n   bo->anchor = NULL;\n\n   if (bo->exec) {"
           )
-          assert old_bo_exec in src, "Expected kbase_kmod_bo_alloc exec block not found"
-          src = src.replace(old_bo_exec, new_bo_exec, 1)
 
-          # 5a. Conservar csf_group/csf_seq en ks_transfer y esperar por el hilo CSF en ks_export_sync_file
-          old_ks_transfer = (
-              "   if (d && s && d != s) {\n"
-              "      ks_set_state(d, s->state, s->fd >= 0 ? dup(s->fd) : -1);\n"
-              "      d->external = s->external;\n"
-              "      pthread_cond_broadcast(&ks_cond);\n"
-              "   }"
+          # 5a. Conservar csf_group/csf_seq en ks_transfer y esperar por CSF en ks_export_sync_file
+          sub(
+              "      d->external = s->external;\n      pthread_cond_broadcast(&ks_cond);",
+              "      d->external = s->external; d->csf_group = s->csf_group; d->csf_seq = s->csf_seq;\n      pthread_cond_broadcast(&ks_cond);"
           )
-          new_ks_transfer = (
-              "   if (d && s && d != s) {\n"
-              "      ks_set_state(d, s->state, s->fd >= 0 ? dup(s->fd) : -1);\n"
-              "      d->external = s->external;\n"
-              "      d->csf_group = s->csf_group;\n"
-              "      d->csf_seq = s->csf_seq;\n"
-              "      pthread_cond_broadcast(&ks_cond);\n"
-              "   }"
-          )
-          assert old_ks_transfer in src, "Expected ks_transfer block not found"
-          src = src.replace(old_ks_transfer, new_ks_transfer, 1)
-
-          old_ks_export = (
-              "      if (o->fd >= 0) {\n"
-              "         /* The GPU is still at it: hand out the fence-trigger sync file. */\n"
-              "         *out_fd = dup(o->fd);\n"
-              "         pthread_mutex_unlock(&ks_lock);\n"
-              "         return *out_fd >= 0 ? 0 : ks_ret(-errno);\n"
-              "      }\n"
+          sub(
               "      /* Submitted without a sync file: all that is left is to wait for the GPU. */\n"
-              "      ret = ks_wait_locked(&handle, 1, deadline, 0, NULL);"
-          )
-          new_ks_export = (
-              "      if (o->fd >= 0) {\n"
-              "         /* The GPU is still at it: hand out the fence-trigger sync file. */\n"
-              "         *out_fd = dup(o->fd);\n"
-              "         pthread_mutex_unlock(&ks_lock);\n"
-              "         return *out_fd >= 0 ? 0 : ks_ret(-errno);\n"
-              "      }\n"
+              "      ret = ks_wait_locked(&handle, 1, deadline, 0, NULL);",
               "      if (!o->external && o->csf_group && o->csf_seq) {\n"
-              "         struct pan_kmod_kbase_csf_group *csf_g =\n"
-              "            (struct pan_kmod_kbase_csf_group *)o->csf_group;\n"
-              "         const uint64_t csf_seq = o->csf_seq;\n"
+              "         struct pan_kmod_kbase_csf_group *cg = (struct pan_kmod_kbase_csf_group *)o->csf_group;\n"
+              "         const uint64_t cs = o->csf_seq;\n"
               "         pthread_mutex_unlock(&ks_lock);\n"
-              "         if (!pan_kmod_kbase_csf_wait(csf_g, csf_seq, (int64_t)deadline)) {\n"
-              '            mesa_loge("kbase: sync file export CSF wait timed out (seq %" PRIu64 ")", csf_seq);\n'
-              "            return ks_ret(-ETIME);\n"
-              "         }\n"
-              "         *out_fd = -1;\n"
-              "         return 0;\n"
+              '         if (!pan_kmod_kbase_csf_wait(cg, cs, (int64_t)deadline)) { mesa_loge("kbase: export CSF wait timeout (seq %" PRIu64 ")", cs); return ks_ret(-ETIME); }\n'
+              "         *out_fd = -1; return 0;\n"
               "      }\n"
-              "      /* Submitted without a sync file: all that is left is to wait for the GPU. */\n"
               "      ret = ks_wait_locked(&handle, 1, deadline, 0, NULL);"
           )
-          assert old_ks_export in src, "Expected ks_export_sync_file block not found"
-          src = src.replace(old_ks_export, new_ks_export, 1)
 
-          # 5b. Watchdog de diagnostico cada 5s si una espera infinita (INT64_MAX) se queda colgada
-          old_ks_wait = (
-              "   const bool all = flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL;\n"
-              "   const bool available = flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE;\n\n"
-              "   for (;;) {"
-          )
-          new_ks_wait = (
-              "   const bool all = flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL;\n"
+          # 5b. Watchdog 5s para esperas infinitas INT64_MAX en ks_wait_locked y pan_kmod_kbase_csf_wait
+          sub(
+              "   const bool available = flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE;\n\n   for (;;) {",
               "   const bool available = flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE;\n"
-              "   uint64_t next_log = timeout_nsec == INT64_MAX ? ks_now() + 5000000000ull : 0;\n\n"
-              "   for (;;) {"
+              "   uint64_t next_log = timeout_nsec == INT64_MAX ? ks_now() + 5000000000ull : 0;\n\n   for (;;) {"
           )
-          assert old_ks_wait in src, "Expected ks_wait_locked head not found"
-          src = src.replace(old_ks_wait, new_ks_wait, 1)
-
-          old_ks_wait_sleep = (
-              "      if (external) {\n"
-              "         /* An imported sync file signals without telling anyone: look again in a millisecond. */\n"
-              "         const uint64_t next = MIN2((uint64_t)timeout_nsec, ks_now() + 1000000ull);\n"
-              "         const struct timespec ts = {.tv_sec = next / 1000000000ull, .tv_nsec = next % 1000000000ull};\n"
-              "         pthread_cond_timedwait(&ks_cond, &ks_lock, &ts);\n"
-              "      } else if (timeout_nsec == INT64_MAX) {\n"
-              "         pthread_cond_wait(&ks_cond, &ks_lock);\n"
-              "      }"
-          )
-          new_ks_wait_sleep = (
+          sub(
+              "      if (external) {",
               "      if (timeout_nsec == INT64_MAX && ks_now() >= next_log) {\n"
               "         struct ks_obj *o0 = n ? ks_get(handles[0]) : NULL;\n"
               '         mesa_loge("kbase ks_wait >5s: n=%u done=%u flags=0x%x o0(state=%u ext=%d fd=%d seq=%" PRIu64 ")",\n'
-              "                   n, done, flags, o0 ? (unsigned)o0->state : 255u,\n"
-              "                   o0 ? (int)o0->external : 0, o0 ? o0->fd : -1,\n"
-              "                   o0 ? o0->csf_seq : (uint64_t)0);\n"
+              "                   n, done, flags, o0 ? (unsigned)o0->state : 255u, o0 ? (int)o0->external : 0, o0 ? o0->fd : -1, o0 ? o0->csf_seq : (uint64_t)0);\n"
               "         next_log = ks_now() + 5000000000ull;\n"
               "      }\n"
-              "      if (external) {\n"
-              "         /* An imported sync file signals without telling anyone: look again in a millisecond. */\n"
-              "         const uint64_t next = MIN2((uint64_t)timeout_nsec, ks_now() + 1000000ull);\n"
-              "         const struct timespec ts = {.tv_sec = next / 1000000000ull, .tv_nsec = next % 1000000000ull};\n"
-              "         pthread_cond_timedwait(&ks_cond, &ks_lock, &ts);\n"
-              "      } else if (timeout_nsec == INT64_MAX) {\n"
-              "         const struct timespec ts = {.tv_sec = next_log / 1000000000ull,\n"
-              "                                     .tv_nsec = next_log % 1000000000ull};\n"
-              "         pthread_cond_timedwait(&ks_cond, &ks_lock, &ts);\n"
-              "      }"
+              "      if (external) {"
           )
-          assert old_ks_wait_sleep in src, "Expected ks_wait_locked sleep block not found"
-          src = src.replace(old_ks_wait_sleep, new_ks_wait_sleep, 1)
-
-          old_csf_wait = (
-              "bool\n"
+          sub(
+              "      } else if (timeout_nsec == INT64_MAX) {\n         pthread_cond_wait(&ks_cond, &ks_lock);",
+              "      } else if (timeout_nsec == INT64_MAX) {\n"
+              "         const struct timespec ts = {.tv_sec = next_log / 1000000000ull, .tv_nsec = next_log % 1000000000ull};\n"
+              "         pthread_cond_timedwait(&ks_cond, &ks_lock, &ts);"
+          )
+          sub(
               "pan_kmod_kbase_csf_wait(struct pan_kmod_kbase_csf_group *g, uint64_t seq, int64_t abs_timeout_ns)\n"
               "{\n"
               "   struct kbase_csf_dev *c = g->kdev->csfq;\n"
-              "   bool done = false;\n\n"
-              "   pthread_mutex_lock(&c->lock);\n"
-              "   if (!seq)\n"
-              "      seq = g->next_seq - 1;\n"
-              "   for (;;) {\n"
-              "      if (g->done_seq >= seq) {\n"
-              "         done = true;\n"
-              "         break;\n"
+              "   bool done = false;",
+              "pan_kmod_kbase_csf_wait(struct pan_kmod_kbase_csf_group *g, uint64_t seq, int64_t abs_timeout_ns)\n"
+              "{\n"
+              "   struct kbase_csf_dev *c = g->kdev->csfq;\n"
+              "   bool done = false; int64_t next_log_ns = 0;"
+          )
+          sub(
+              "      if (abs_timeout_ns == INT64_MAX) {\n"
+              "         pthread_cond_wait(&c->cond, &c->lock);\n"
+              "         continue;\n"
               "      }\n"
-              "      if (abs_ti
+              "      struct timespec now;\n"
+              "      clock_gettime(CLOCK_MONOTONIC, &now);\n"
+              "      if ((int64_t)now.tv_sec * 1000000000ll + now.tv_nsec >= abs_timeout_ns)\n"
+              "         break;\n"
+              "      const struct timespec until = {.tv_sec = abs_timeout_ns / 1000000000ll,\n"
+              "                                     .tv_nsec = abs_timeout_ns % 1000000000ll};",
+              "      struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);\n"
+              "      const int64_t now_ns = (int64_t)now.tv_sec * 1000000000ll + now.tv_nsec;\n"
+              "      if (abs_timeout_ns != INT64_MAX && now_ns >= abs_timeout_ns) break;\n"
+              "      int64_t wait_ns = abs_timeout_ns;\n"
+              "      if (abs_timeout_ns == INT64_MAX) {\n"
+              "         if (!next_log_ns) next_log_ns = now_ns + 5000000000ll;\n"
+              "         if (now_ns >= next_log_ns) {\n"
+              '            mesa_loge("kbase csf_wait >5s: grp=%u want=%" PRIu64 " done=%" PRIu64 " subs=%u flt=%d q0=%" PRIu64 "/%" PRIu64 " q1=%" PRIu64 "/%" PRIu64,\n'
+              "                      g->handle, seq, g->done_seq, g->nr_subs, g->faulted,\n"
+              "                      (uint64_t)g->seqno[0], g->ring[0].insert, (uint64_t)g->seqno[8], g->ring[1].insert);\n"
+              "            next_log_ns = now_ns + 5000000000ll;\n"
+              "         }\n"
+              "         wait_ns = next_log_ns;\n"
+              "      }\n"
+              "      const struct timespec until = {.tv_sec = wait_ns / 1000000000ll, .tv_nsec = wait_ns % 1000000000ll};"
+          )
+
+          # 5c. Desactivar KCPU_QUEUE fence_fd (evita freeze negro en SurfaceFlinger)
+          i = s.index("int\npan_kmod_kbase_csf_fence_fd(struct pan_kmod_kbase_csf_group *g, uint64_t seq)\n{")
+          j = s.index("\nbool\npan_kmod_kbase_csf_group_faulted(")
+          s = s[:i] + "int\npan_kmod_kbase_csf_fence_fd(struct pan_kmod_kbase_csf_group *g, uint64_t seq)\n{\n   (void)g; (void)seq; return -1;\n}\n" + s[j:]
+
+          p.write_text(s)
+          print("Successfully patched kbase_kmod.c (all 5 patches)")
+          PY
+
+      - name: Build Android PanVK driver & package zip
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          echo "Using NDK: ${{ steps.setup-ndk.outputs.ndk-path }}"
+          chmod +x build.sh
+          ./build.sh "${{ steps.setup-ndk.outputs.ndk-path }}"
+
+      - name: Prepare driver files for single-zip artifact
+        run: |
+          mkdir -p dist/artifact
+          unzip -o dist/*.zip -d dist/artifact
+
+      - name: Upload compiled driver zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: mali-panvk-dimensity7030-fixed
+          path: dist/artifact/
