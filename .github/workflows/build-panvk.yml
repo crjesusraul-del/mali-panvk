@@ -20,81 +20,83 @@ jobs:
           p = Path("src/panfrost/lib/kmod/kbase_kmod.c")
           src = p.read_text()
 
-          old_struct = """union kbase_ioctl_cs_tiler_heap_init {
-             struct {
-                uint32_t chunk_size;
-                uint32_t initial_chunks;
-                uint32_t max_chunks;
-                uint16_t target_in_flight;
-                uint8_t group_id;
-                uint8_t padding;
-                uint64_t buf_desc_va;
-             } in;
-             struct {
-                uint64_t gpu_heap_va;
-                uint64_t first_chunk_va;
-             } out;
-          };"""
+          old_struct = (
+              "union kbase_ioctl_cs_tiler_heap_init {\n"
+              "   struct {\n"
+              "      uint32_t chunk_size;\n"
+              "      uint32_t initial_chunks;\n"
+              "      uint32_t max_chunks;\n"
+              "      uint16_t target_in_flight;\n"
+              "      uint8_t group_id;\n"
+              "      uint8_t padding;\n"
+              "      uint64_t buf_desc_va;\n"
+              "   } in;\n"
+              "   struct {\n"
+              "      uint64_t gpu_heap_va;\n"
+              "      uint64_t first_chunk_va;\n"
+              "   } out;\n"
+              "};"
+          )
 
-          new_struct = old_struct + """
+          new_struct = old_struct + (
+              "\n\n"
+              "/* Older CSF kbase (e.g. Mali-G610 / MediaTek Dimensity DDK < r44) omits buf_desc_va (16 bytes). */\n"
+              "union kbase_ioctl_cs_tiler_heap_init_v1_13 {\n"
+              "   struct {\n"
+              "      uint32_t chunk_size;\n"
+              "      uint32_t initial_chunks;\n"
+              "      uint32_t max_chunks;\n"
+              "      uint16_t target_in_flight;\n"
+              "      uint8_t group_id;\n"
+              "      uint8_t padding;\n"
+              "   } in;\n"
+              "   struct {\n"
+              "      uint64_t gpu_heap_va;\n"
+              "      uint64_t first_chunk_va;\n"
+              "   } out;\n"
+              "};"
+          )
 
-          /* Older CSF kbase (e.g. Mali-G610 / MediaTek Dimensity DDK < r44) omits buf_desc_va (16 bytes). */
-          union kbase_ioctl_cs_tiler_heap_init_v1_13 {
-             struct {
-                uint32_t chunk_size;
-                uint32_t initial_chunks;
-                uint32_t max_chunks;
-                uint16_t target_in_flight;
-                uint8_t group_id;
-                uint8_t padding;
-             } in;
-             struct {
-                uint64_t gpu_heap_va;
-                uint64_t first_chunk_va;
-             } out;
-          };"""
+          old_macro = (
+              "#define KBASE_IOCTL_CS_TILER_HEAP_INIT                                                            \\\n"
+              "   _IOWR(KBASE_IOCTL_TYPE, 48, union kbase_ioctl_cs_tiler_heap_init)"
+          )
 
-          old_macro = """#define KBASE_IOCTL_CS_TILER_HEAP_INIT                                                            \\
-             _IOWR(KBASE_IOCTL_TYPE, 48, union kbase_ioctl_cs_tiler_heap_init)"""
+          new_macro = old_macro + (
+              "\n#define KBASE_IOCTL_CS_TILER_HEAP_INIT_V1_13                                                      \\\n"
+              "   _IOWR(KBASE_IOCTL_TYPE, 48, union kbase_ioctl_cs_tiler_heap_init_v1_13)"
+          )
 
-          new_macro = old_macro + """
-          #define KBASE_IOCTL_CS_TILER_HEAP_INIT_V1_13                                                      \\
-             _IOWR(KBASE_IOCTL_TYPE, 48, union kbase_ioctl_cs_tiler_heap_init_v1_13)"""
+          old_func = (
+              "   if (pan_kmod_ioctl(dev->fd, KBASE_IOCTL_CS_TILER_HEAP_INIT, &req)) {\n"
+              '      mesa_loge("kbase: CS_TILER_HEAP_INIT failed (err=%d)", errno);\n'
+              "      return false;\n"
+              "   }"
+          )
 
-          old_func = """   if (pan_kmod_ioctl(dev->fd, KBASE_IOCTL_CS_TILER_HEAP_INIT, &req)) {
-                mesa_loge("kbase: CS_TILER_HEAP_INIT failed (err=%d)", errno);
-                return false;
-             }"""
+          new_func = (
+              "   if (pan_kmod_ioctl(dev->fd, KBASE_IOCTL_CS_TILER_HEAP_INIT, &req)) {\n"
+              "      if (errno == ENOTTY) {\n"
+              "         union kbase_ioctl_cs_tiler_heap_init_v1_13 req_v1 = {\n"
+              "            .in = {\n"
+              "               .chunk_size = chunk_size,\n"
+              "               .initial_chunks = initial_chunks,\n"
+              "               .max_chunks = max_chunks,\n"
+              "               .target_in_flight = target_in_flight,\n"
+              "            },\n"
+              "         };\n"
+              "         if (pan_kmod_ioctl(dev->fd, KBASE_IOCTL_CS_TILER_HEAP_INIT_V1_13, &req_v1) == 0) {\n"
+              "            *heap_ctx_va = req_v1.out.gpu_heap_va;\n"
+              "            *first_chunk_va = req_v1.out.first_chunk_va;\n"
+              "            return true;\n"
+              "         }\n"
+              "      }\n"
+              '      mesa_loge("kbase: CS_TILER_HEAP_INIT failed (err=%d)", errno);\n'
+              "      return false;\n"
+              "   }"
+          )
 
-          new_func = """   if (pan_kmod_ioctl(dev->fd, KBASE_IOCTL_CS_TILER_HEAP_INIT, &req)) {
-                if (errno == ENOTTY) {
-                   union kbase_ioctl_cs_tiler_heap_init_v1_13 req_v1 = {
-                      .in = {
-                         .chunk_size = chunk_size,
-                         .initial_chunks = initial_chunks,
-                         .max_chunks = max_chunks,
-                         .target_in_flight = target_in_flight,
-                      },
-                   };
-                   if (pan_kmod_ioctl(dev->fd, KBASE_IOCTL_CS_TILER_HEAP_INIT_V1_13, &req_v1) == 0) {
-                      *heap_ctx_va = req_v1.out.gpu_heap_va;
-                      *first_chunk_va = req_v1.out.first_chunk_va;
-                      return true;
-                   }
-                }
-                mesa_loge("kbase: CS_TILER_HEAP_INIT failed (err=%d)", errno);
-                return false;
-             }"""
-
-          # Dedent multiline literals to match exact file indentation
-          import textwrap
-          def ded(s): return textwrap.dedent(s)
-
-          for needle, repl in [
-              (ded(old_struct), ded(new_struct)),
-              (ded(old_macro), ded(new_macro)),
-              (ded(old_func), ded(new_func)),
-          ]:
+          for needle, repl in [(old_struct, new_struct), (old_macro, new_macro), (old_func, new_func)]:
               assert needle in src, f"Expected block not found:\n{needle}"
               src = src.replace(needle, repl, 1)
 
@@ -108,7 +110,7 @@ jobs:
           sudo apt-get install -y \
             build-essential cmake ninja-build glslang-tools pkg-config \
             python3-pip python3-mako python3-packaging python3-yaml \
-            wget unzip ca-certificates gnupg software-properties-common git
+            spirv-headers wget unzip ca-certificates gnupg software-properties-common git
 
           # Meson >= 1.4.0 required by build.sh
           python3 -m pip install --break-system-packages "meson>=1.4.0"
@@ -122,11 +124,12 @@ jobs:
           # Install libllvmspirvlib-21-dev if packaged, otherwise build SPIRV-LLVM-Translator 21
           if ! sudo apt-get install -y libllvmspirvlib-21-dev; then
             git clone --depth=1 -b llvm_release_210 https://github.com/KhronosGroup/SPIRV-LLVM-Translator.git /tmp/spirv-llvm
+            git clone --depth=1 https://github.com/KhronosGroup/SPIRV-Headers.git /tmp/spirv-headers
             cmake -B /tmp/spirv-llvm/build -S /tmp/spirv-llvm -G Ninja \
               -DCMAKE_BUILD_TYPE=Release \
               -DCMAKE_INSTALL_PREFIX=/usr \
               -DLLVM_DIR=/usr/lib/llvm-21/lib/cmake/llvm \
-              -DLLVM_EXTERNAL_SPIRV_HEADERS_SOURCE_DIR=""
+              -DLLVM_EXTERNAL_SPIRV_HEADERS_SOURCE_DIR=/tmp/spirv-headers
             cmake --build /tmp/spirv-llvm/build --parallel
             sudo cmake --install /tmp/spirv-llvm/build
           fi
