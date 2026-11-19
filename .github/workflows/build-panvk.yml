@@ -1,18 +1,36 @@
-name: Build PanVK (Mali-G610 CSF Fix)
+name: Build PanVK Mali (Dimensity 7030 / kbase patch)
 
 on:
   workflow_dispatch:
-  push:
-    branches: [ main, master ]
 
 jobs:
   build:
     runs-on: ubuntu-24.04
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Patch kbase_kmod.c for legacy CSF CS_TILER_HEAP_INIT (16-byte fallback on ENOTTY)
+      - name: Install host build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            meson ninja-build pkg-config glslang-tools \
+            python3-mako python3-packaging python3-yaml \
+            clang llvm-dev libclang-dev libclc-18-dev libllvmspirvlib-18-dev \
+            bison flex patchelf zip unzip curl
+          if [ "$(meson --version | cut -d. -f2)" -lt 4 ]; then
+            pip3 install --break-system-packages --upgrade "meson>=1.4.0"
+          fi
+
+      - name: Setup Android NDK r29
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r29
+          add-to-path: false
+
+      - name: Patch CS_TILER_HEAP_INIT ENOTTY fallback for older kbase (Mali-G610 / Dimensity 7030)
         run: |
           python3 - <<'PY'
           from pathlib import Path
@@ -20,27 +38,11 @@ jobs:
           p = Path("src/panfrost/lib/kmod/kbase_kmod.c")
           src = p.read_text()
 
-          old_struct = (
-              "union kbase_ioctl_cs_tiler_heap_init {\n"
-              "   struct {\n"
-              "      uint32_t chunk_size;\n"
-              "      uint32_t initial_chunks;\n"
-              "      uint32_t max_chunks;\n"
-              "      uint16_t target_in_flight;\n"
-              "      uint8_t group_id;\n"
-              "      uint8_t padding;\n"
-              "      uint64_t buf_desc_va;\n"
-              "   } in;\n"
-              "   struct {\n"
-              "      uint64_t gpu_heap_va;\n"
-              "      uint64_t first_chunk_va;\n"
-              "   } out;\n"
-              "};"
+          old_ioctl = (
+              "#define KBASE_IOCTL_CS_TILER_HEAP_INIT                                                            \\\n"
+              "   _IOWR(KBASE_IOCTL_TYPE, 48, union kbase_ioctl_cs_tiler_heap_init)"
           )
-
-          new_struct = old_struct + (
-              "\n\n"
-              "/* Older CSF kbase (e.g. Mali-G610 / MediaTek Dimensity DDK < r44) omits buf_desc_va (16 bytes). */\n"
+          new_ioctl = (
               "union kbase_ioctl_cs_tiler_heap_init_v1_13 {\n"
               "   struct {\n"
               "      uint32_t chunk_size;\n"
@@ -54,30 +56,26 @@ jobs:
               "      uint64_t gpu_heap_va;\n"
               "      uint64_t first_chunk_va;\n"
               "   } out;\n"
-              "};"
+              "};\n\n"
+              "#define KBASE_IOCTL_CS_TILER_HEAP_INIT_V1_13                                                      \\\n"
+              "   _IOWR(KBASE_IOCTL_TYPE, 48, union kbase_ioctl_cs_tiler_heap_init_v1_13)\n\n"
+              + old_ioctl
           )
-
-          old_macro = (
-              "#define KBASE_IOCTL_CS_TILER_HEAP_INIT                                                            \\\n"
-              "   _IOWR(KBASE_IOCTL_TYPE, 48, union kbase_ioctl_cs_tiler_heap_init)"
-          )
-
-          new_macro = old_macro + (
-              "\n#define KBASE_IOCTL_CS_TILER_HEAP_INIT_V1_13                                                      \\\n"
-              "   _IOWR(KBASE_IOCTL_TYPE, 48, union kbase_ioctl_cs_tiler_heap_init_v1_13)"
-          )
+          assert old_ioctl in src, "Expected KBASE_IOCTL_CS_TILER_HEAP_INIT block not found"
+          src = src.replace(old_ioctl, new_ioctl, 1)
 
           old_func = (
               "   if (pan_kmod_ioctl(dev->fd, KBASE_IOCTL_CS_TILER_HEAP_INIT, &req)) {\n"
               '      mesa_loge("kbase: CS_TILER_HEAP_INIT failed (err=%d)", errno);\n'
               "      return false;\n"
-              "   }"
+              "   }\n"
+              "   *heap_ctx_va = req.out.gpu_heap_va;\n"
+              "   *first_chunk_va = req.out.first_chunk_va;"
           )
-
           new_func = (
               "   if (pan_kmod_ioctl(dev->fd, KBASE_IOCTL_CS_TILER_HEAP_INIT, &req)) {\n"
               "      if (errno == ENOTTY) {\n"
-              "         union kbase_ioctl_cs_tiler_heap_init_v1_13 req_v1 = {\n"
+              "         union kbase_ioctl_cs_tiler_heap_init_v1_13 req_legacy = {\n"
               "            .in = {\n"
               "               .chunk_size = chunk_size,\n"
               "               .initial_chunks = initial_chunks,\n"
@@ -85,68 +83,38 @@ jobs:
               "               .target_in_flight = target_in_flight,\n"
               "            },\n"
               "         };\n"
-              "         if (pan_kmod_ioctl(dev->fd, KBASE_IOCTL_CS_TILER_HEAP_INIT_V1_13, &req_v1) == 0) {\n"
-              "            *heap_ctx_va = req_v1.out.gpu_heap_va;\n"
-              "            *first_chunk_va = req_v1.out.first_chunk_va;\n"
-              "            return true;\n"
+              "         if (pan_kmod_ioctl(dev->fd, KBASE_IOCTL_CS_TILER_HEAP_INIT_V1_13, &req_legacy)) {\n"
+              '            mesa_loge("kbase: CS_TILER_HEAP_INIT (legacy) failed (err=%d)", errno);\n'
+              "            return false;\n"
               "         }\n"
+              "         *heap_ctx_va = req_legacy.out.gpu_heap_va;\n"
+              "         *first_chunk_va = req_legacy.out.first_chunk_va;\n"
+              "         return true;\n"
               "      }\n"
               '      mesa_loge("kbase: CS_TILER_HEAP_INIT failed (err=%d)", errno);\n'
               "      return false;\n"
-              "   }"
+              "   }\n"
+              "   *heap_ctx_va = req.out.gpu_heap_va;\n"
+              "   *first_chunk_va = req.out.first_chunk_va;"
           )
-
-          for needle, repl in [(old_struct, new_struct), (old_macro, new_macro), (old_func, new_func)]:
-              assert needle in src, f"Expected block not found:\n{needle}"
-              src = src.replace(needle, repl, 1)
+          assert old_func in src, "Expected call block not found"
+          src = src.replace(old_func, new_func, 1)
 
           p.write_text(src)
           print("Successfully patched kbase_kmod.c")
           PY
 
-      - name: Install host build dependencies & LLVM 21
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential cmake ninja-build glslang-tools pkg-config \
-            python3-pip python3-mako python3-packaging python3-yaml \
-            spirv-headers wget unzip ca-certificates gnupg software-properties-common git
-
-          # Meson >= 1.4.0 required by build.sh
-          python3 -m pip install --break-system-packages "meson>=1.4.0"
-
-          # LLVM 21 toolchain
-          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
-          sudo add-apt-repository -y "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main"
-          sudo apt-get update
-          sudo apt-get install -y llvm-21-dev libclang-21-dev clang-21 libclc-21-dev
-
-          # Install libllvmspirvlib-21-dev if packaged, otherwise build SPIRV-LLVM-Translator 21
-          if ! sudo apt-get install -y libllvmspirvlib-21-dev; then
-            git clone --depth=1 -b llvm_release_210 https://github.com/KhronosGroup/SPIRV-LLVM-Translator.git /tmp/spirv-llvm
-            git clone --depth=1 https://github.com/KhronosGroup/SPIRV-Headers.git /tmp/spirv-headers
-            cmake -B /tmp/spirv-llvm/build -S /tmp/spirv-llvm -G Ninja \
-              -DCMAKE_BUILD_TYPE=Release \
-              -DCMAKE_INSTALL_PREFIX=/usr \
-              -DLLVM_DIR=/usr/lib/llvm-21/lib/cmake/llvm \
-              -DLLVM_EXTERNAL_SPIRV_HEADERS_SOURCE_DIR=/tmp/spirv-headers
-            cmake --build /tmp/spirv-llvm/build --parallel
-            sudo cmake --install /tmp/spirv-llvm/build
-          fi
-
-      - name: Setup Android NDK r29
-        uses: nttld/setup-ndk@v1
-        with:
-          ndk-version: r29
-          add-to-path: false
-
       - name: Build Android PanVK driver & package zip
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
+          echo "Using NDK: ${{ steps.setup-ndk.outputs.ndk-path }}"
           chmod +x build.sh
-          ./build.sh "${{ env.ANDROID_NDK_HOME }}"
+          ./build.sh "${{ steps.setup-ndk.outputs.ndk-path }}"
 
       - name: Upload compiled driver zip
         uses: actions/upload-artifact@v4
         with:
-          name: mali-panvk-g610-fix
+          name: mali-panvk-dimensity7030-fixed
           path: dist/*.zip
