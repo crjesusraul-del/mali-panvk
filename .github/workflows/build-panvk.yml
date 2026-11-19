@@ -43,7 +43,6 @@ jobs:
               assert s.count(old) == 1, f"Match count {s.count(old)} for {old[:50]!r}"
               s = s.replace(old, new, 1)
 
-          # 1. CS_TILER_HEAP_INIT (24B -> 16B v1.13)
           sub(
               "#define KBASE_IOCTL_CS_TILER_HEAP_INIT                                                            \\\n"
               "   _IOWR(KBASE_IOCTL_TYPE, 48, union kbase_ioctl_cs_tiler_heap_init)",
@@ -73,7 +72,6 @@ jobs:
               "   }"
           )
 
-          # 2. CS_QUEUE_GROUP_CREATE (112B ioctl 58 -> 40B ioctl 58 -> 32B ioctl 42)
           sub(
               "#define KBASE_IOCTL_CS_QUEUE_GROUP_CREATE                                                         \\\n"
               "   _IOWR(KBASE_IOCTL_TYPE, 58, union kbase_ioctl_cs_queue_group_create)",
@@ -108,7 +106,6 @@ jobs:
               "   g->handle = gh;"
           )
 
-          # 3. Scoreboards reales (0xff en G610, 0xffff en G720)
           sub(
               "      kbase_csf_emit(r, cs_ins(CS_OP_FLUSH_CACHE2,\n"
               "                               (V << 40) | (0xffffull << 16) | (1u << 4) | 1u)); /* clean */\n"
@@ -118,7 +115,6 @@ jobs:
               "      kbase_csf_emit(r, cs_ins(CS_OP_WAIT, sb_all << 16));"
           )
 
-          # 4. MEM_EXEC_INIT antes de MEM_JIT_INIT + BASE_MEM_NEED_MMAP
           sub(
               "      if (vc.major == 1) {\n"
               "         struct kbase_ioctl_mem_jit_init jit = {\n"
@@ -145,7 +141,6 @@ jobs:
               "   bo->exec = exec && !need_mmap;\n   bo->anchor = NULL;\n\n   if (bo->exec) {"
           )
 
-          # 5a. Conservar csf_group/csf_seq en ks_transfer y esperar por CSF en ks_export_sync_file
           sub(
               "      d->external = s->external;\n      pthread_cond_broadcast(&ks_cond);",
               "      d->external = s->external; d->csf_group = s->csf_group; d->csf_seq = s->csf_seq;\n      pthread_cond_broadcast(&ks_cond);"
@@ -163,7 +158,6 @@ jobs:
               "      ret = ks_wait_locked(&handle, 1, deadline, 0, NULL);"
           )
 
-          # 5b. Watchdog 5s para esperas infinitas INT64_MAX en ks_wait_locked y pan_kmod_kbase_csf_wait
           sub(
               "   const bool available = flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE;\n\n   for (;;) {",
               "   const bool available = flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE;\n"
@@ -223,14 +217,34 @@ jobs:
               "      const struct timespec until = {.tv_sec = wait_ns / 1000000000ll, .tv_nsec = wait_ns % 1000000000ll};"
           )
 
-          # 5c. Desactivar KCPU_QUEUE fence_fd (evita freeze negro en SurfaceFlinger)
           i = s.index("int\npan_kmod_kbase_csf_fence_fd(struct pan_kmod_kbase_csf_group *g, uint64_t seq)\n{")
           j = s.index("\nbool\npan_kmod_kbase_csf_group_faulted(")
           s = s[:i] + "int\npan_kmod_kbase_csf_fence_fd(struct pan_kmod_kbase_csf_group *g, uint64_t seq)\n{\n   (void)g; (void)seq; return -1;\n}\n" + s[j:]
 
+          # 7a. Wakeup eventfd + ppoll 200us en kbase_csf_thread (quita espera de 50ms)
+          sub("#include <errno.h>", "#ifndef _GNU_SOURCE\n#define _GNU_SOURCE\n#endif\n#include <errno.h>\n#include <sys/eventfd.h>")
+          sub("   bool kcpu_created;\n   uint8_t kcpu_id;\n};", "   bool kcpu_created; uint8_t kcpu_id; int wake_fd;\n};")
+          sub("   list_inithead(&c->groups);\n   kdev->csfq = c;", "   list_inithead(&c->groups);\n   c->wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);\n   kdev->csfq = c;")
+          sub(
+              "   c->stop = true;\n   const bool started = c->thread_started;\n   pthread_mutex_unlock(&c->lock);\n   if (started)\n      pthread_join(c->thread, NULL);",
+              "   c->stop = true;\n   const bool started = c->thread_started;\n   pthread_mutex_unlock(&c->lock);\n   if (c->wake_fd >= 0) { uint64_t one = 1; (void)!write(c->wake_fd, &one, 8); }\n   if (started) pthread_join(c->thread, NULL);\n   if (c->wake_fd >= 0) close(c->wake_fd);"
+          )
+          sub(
+              "      struct pollfd pfd = {.fd = kdev->base.fd, .events = POLLIN};\n      if (poll(&pfd, 1, busy ? 2 : 50) > 0 && (pfd.revents & POLLIN)) {",
+              "      struct pollfd pfds[2] = {{.fd = kdev->base.fd, .events = POLLIN}, {.fd = c->wake_fd, .events = POLLIN}};\n"
+              "      struct timespec pto = {.tv_sec = 0, .tv_nsec = busy ? 200000L : 50000000L};\n"
+              "      if (ppoll(pfds, c->wake_fd >= 0 ? 2 : 1, &pto, NULL) > 0) {\n"
+              "         if (c->wake_fd >= 0 && (pfds[1].revents & POLLIN)) { uint64_t ev; while (read(c->wake_fd, &ev, 8) > 0) {} }\n"
+              "         if (pfds[0].revents & POLLIN) {"
+          )
+          sub(
+              "                  g->faulted = true;\n            }\n            pthread_mutex_unlock(&c->lock);\n         }\n      }",
+              "                  g->faulted = true;\n            }\n            pthread_mutex_unlock(&c->lock);\n         }\n         }\n      }"
+          )
+          sub("   return sub.seq;\n}", "   if (c->wake_fd >= 0) { uint64_t one = 1; (void)!write(c->wake_fd, &one, 8); }\n   return sub.seq;\n}")
+
           p.write_text(s)
 
-          # 6. Gralloc Dimensity 7030: forzar linear (SW_READ/WRITE) + layout {17,2,3,4}
           def rep(path, old, new):
               fp = Path(path)
               txt = fp.read_text()
@@ -256,7 +270,9 @@ jobs:
           rep("src/util/u_gralloc/u_gralloc_fallback.c",
               "   {16, 1, 2, 3}, /* MediaTek, Android 17 */",
               "   {16, 1, 2, 3}, /* MediaTek, Android 17 */\n   {17, 2, 3, 4}, /* MediaTek, Android 15 */")
-          print("Successfully patched kbase_kmod.c + gralloc linear/MTK3 (all 6 patches)")
+          # 7b. HOST_CACHED (WB_MMAP) antes de HOST_COHERENT
+          rep("src/panfrost/vulkan/panvk_physical_device.c", "   if (PANVK_DEBUG(CACHED_BEFORE_COHERENT) &&", "   if (!PANVK_DEBUG(NO_WB_MMAP) &&")
+          print("Successfully patched kbase_kmod.c + gralloc + perf (all 7 patches)")
           PY
 
       - name: Build Android PanVK driver & package zip
