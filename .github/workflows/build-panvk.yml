@@ -30,7 +30,7 @@ jobs:
           ndk-version: r29
           add-to-path: false
 
-      - name: Patch CS_TILER_HEAP_INIT ENOTTY fallback for older kbase (Mali-G610 / Dimensity 7030)
+      - name: Patch CSF ioctls (CS_TILER_HEAP_INIT & CS_QUEUE_GROUP_CREATE) for older kbase
         run: |
           python3 - <<'PY'
           from pathlib import Path
@@ -38,6 +38,7 @@ jobs:
           p = Path("src/panfrost/lib/kmod/kbase_kmod.c")
           src = p.read_text()
 
+          # 1. Fallback para CS_TILER_HEAP_INIT (24B -> 16B)
           old_ioctl = (
               "#define KBASE_IOCTL_CS_TILER_HEAP_INIT                                                            \\\n"
               "   _IOWR(KBASE_IOCTL_TYPE, 48, union kbase_ioctl_cs_tiler_heap_init)"
@@ -97,8 +98,116 @@ jobs:
               "   *heap_ctx_va = req.out.gpu_heap_va;\n"
               "   *first_chunk_va = req.out.first_chunk_va;"
           )
-          assert old_func in src, "Expected call block not found"
+          assert old_func in src, "Expected CS_TILER_HEAP_INIT call block not found"
           src = src.replace(old_func, new_func, 1)
+
+          # 2. Fallback para CS_QUEUE_GROUP_CREATE (112B ioctl 58 -> 40B ioctl 58 -> 32B ioctl 42)
+          old_gc_ioctl = (
+              "#define KBASE_IOCTL_CS_QUEUE_GROUP_CREATE                                                         \\\n"
+              "   _IOWR(KBASE_IOCTL_TYPE, 58, union kbase_ioctl_cs_queue_group_create)"
+          )
+          new_gc_ioctl = (
+              "union kbase_ioctl_cs_queue_group_create_v40 {\n"
+              "   struct {\n"
+              "      uint64_t tiler_mask;\n"
+              "      uint64_t fragment_mask;\n"
+              "      uint64_t compute_mask;\n"
+              "      uint8_t cs_min;\n"
+              "      uint8_t priority;\n"
+              "      uint8_t tiler_max;\n"
+              "      uint8_t fragment_max;\n"
+              "      uint8_t compute_max;\n"
+              "      uint8_t csi_handlers;\n"
+              "      uint8_t padding[2];\n"
+              "      uint64_t reserved;\n"
+              "   } in;\n"
+              "   struct {\n"
+              "      uint8_t group_handle;\n"
+              "      uint8_t padding[3];\n"
+              "      uint32_t group_uid;\n"
+              "   } out;\n"
+              "};\n\n"
+              "union kbase_ioctl_cs_queue_group_create_1_6 {\n"
+              "   struct {\n"
+              "      uint64_t tiler_mask;\n"
+              "      uint64_t fragment_mask;\n"
+              "      uint64_t compute_mask;\n"
+              "      uint8_t cs_min;\n"
+              "      uint8_t priority;\n"
+              "      uint8_t tiler_max;\n"
+              "      uint8_t fragment_max;\n"
+              "      uint8_t compute_max;\n"
+              "      uint8_t padding[3];\n"
+              "   } in;\n"
+              "   struct {\n"
+              "      uint8_t group_handle;\n"
+              "      uint8_t padding[3];\n"
+              "      uint32_t group_uid;\n"
+              "   } out;\n"
+              "};\n\n"
+              "#define KBASE_IOCTL_CS_QUEUE_GROUP_CREATE_V40                                                     \\\n"
+              "   _IOWR(KBASE_IOCTL_TYPE, 58, union kbase_ioctl_cs_queue_group_create_v40)\n"
+              "#define KBASE_IOCTL_CS_QUEUE_GROUP_CREATE_1_6                                                     \\\n"
+              "   _IOWR(KBASE_IOCTL_TYPE, 42, union kbase_ioctl_cs_queue_group_create_1_6)\n\n"
+              + old_gc_ioctl
+          )
+          assert old_gc_ioctl in src, "Expected KBASE_IOCTL_CS_QUEUE_GROUP_CREATE block not found"
+          src = src.replace(old_gc_ioctl, new_gc_ioctl, 1)
+
+          old_gc_call = (
+              "   if (pan_kmod_ioctl(dev->fd, KBASE_IOCTL_CS_QUEUE_GROUP_CREATE, &gc)) {\n"
+              '      mesa_loge("kbase: CS_QUEUE_GROUP_CREATE failed (err=%d)", errno);\n'
+              "      goto err_free_seq;\n"
+              "   }\n"
+              "   g->handle = gc.out.group_handle;"
+          )
+          new_gc_call = (
+              "   uint8_t group_handle = 0;\n"
+              "   if (pan_kmod_ioctl(dev->fd, KBASE_IOCTL_CS_QUEUE_GROUP_CREATE, &gc)) {\n"
+              "      if (errno == ENOTTY) {\n"
+              "         union kbase_ioctl_cs_queue_group_create_v40 gc40 = {\n"
+              "            .in = {\n"
+              "               .tiler_mask = 1,\n"
+              "               .fragment_mask = fragment_mask,\n"
+              "               .compute_mask = compute_mask,\n"
+              "               .cs_min = nr_queues,\n"
+              "               .priority = priority,\n"
+              "               .tiler_max = 1,\n"
+              "               .fragment_max = max_fragment,\n"
+              "               .compute_max = max_compute,\n"
+              "            },\n"
+              "         };\n"
+              "         union kbase_ioctl_cs_queue_group_create_1_6 gc32 = {\n"
+              "            .in = {\n"
+              "               .tiler_mask = 1,\n"
+              "               .fragment_mask = fragment_mask,\n"
+              "               .compute_mask = compute_mask,\n"
+              "               .cs_min = nr_queues,\n"
+              "               .priority = priority,\n"
+              "               .tiler_max = 1,\n"
+              "               .fragment_max = max_fragment,\n"
+              "               .compute_max = max_compute,\n"
+              "            },\n"
+              "         };\n"
+              "         if (!pan_kmod_ioctl(dev->fd, KBASE_IOCTL_CS_QUEUE_GROUP_CREATE_V40, &gc40)) {\n"
+              "            group_handle = gc40.out.group_handle;\n"
+              "         } else if (errno == ENOTTY && !pan_kmod_ioctl(dev->fd, KBASE_IOCTL_CS_QUEUE_GROUP_CREATE_1_6, &gc32)) {\n"
+              "            group_handle = gc32.out.group_handle;\n"
+              "         } else {\n"
+              '            mesa_loge("kbase: CS_QUEUE_GROUP_CREATE (fallback) failed (err=%d)", errno);\n'
+              "            goto err_free_seq;\n"
+              "         }\n"
+              "      } else {\n"
+              '         mesa_loge("kbase: CS_QUEUE_GROUP_CREATE failed (err=%d)", errno);\n'
+              "         goto err_free_seq;\n"
+              "      }\n"
+              "   } else {\n"
+              "      group_handle = gc.out.group_handle;\n"
+              "   }\n"
+              "   g->handle = group_handle;"
+          )
+          assert old_gc_call in src, "Expected CS_QUEUE_GROUP_CREATE call block not found"
+          src = src.replace(old_gc_call, new_gc_call, 1)
 
           p.write_text(src)
           print("Successfully patched kbase_kmod.c")
@@ -113,8 +222,13 @@ jobs:
           chmod +x build.sh
           ./build.sh "${{ steps.setup-ndk.outputs.ndk-path }}"
 
+      - name: Prepare driver files for single-zip artifact
+        run: |
+          mkdir -p dist/artifact
+          unzip -o dist/*.zip -d dist/artifact
+
       - name: Upload compiled driver zip
         uses: actions/upload-artifact@v4
         with:
           name: mali-panvk-dimensity7030-fixed
-          path: dist/*.zip
+          path: dist/artifact/
