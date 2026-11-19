@@ -248,21 +248,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: mali-panvk-dimensity7030-fixed
-          path: dist/artifact/ env:
-          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
-          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
-        run: |
-          echo "Using NDK: ${{ steps.setup-ndk.outputs.ndk-path }}"
-          chmod +x build.sh
-          ./build.sh "${{ steps.setup-ndk.outputs.ndk-path }}"
-
-      - name: Prepare driver files for single-zip artifact
-        run: |
-          mkdir -p dist/artifact
-          unzip -o dist/*.zip -d dist/artifact
-
-      - name: Upload compiled driver zip
-        uses: actions/upload-artifact@v4
-        with:
-          name: mali-panvk-dimensity7030-fixed
           path: dist/artifact/
