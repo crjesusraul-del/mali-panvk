@@ -30,7 +30,7 @@ jobs:
           ndk-version: r29
           add-to-path: false
 
-      - name: Patch CSF kbase ioctls, scoreboard mask & exec BOs for Mali-G610 / Dimensity 7030
+      - name: Patch CSF kbase ioctls, scoreboard mask, exec BOs & sync wait for Mali-G610 / Dimensity 7030
         run: |
           python3 - <<'PY'
           from pathlib import Path
@@ -271,26 +271,121 @@ jobs:
           assert old_bo_exec in src, "Expected kbase_kmod_bo_alloc exec block not found"
           src = src.replace(old_bo_exec, new_bo_exec, 1)
 
-          p.write_text(src)
-          print("Successfully patched kbase_kmod.c (all 4 patches)")
-          PY
+          # 5a. Conservar csf_group/csf_seq en ks_transfer y esperar por el hilo CSF en ks_export_sync_file
+          old_ks_transfer = (
+              "   if (d && s && d != s) {\n"
+              "      ks_set_state(d, s->state, s->fd >= 0 ? dup(s->fd) : -1);\n"
+              "      d->external = s->external;\n"
+              "      pthread_cond_broadcast(&ks_cond);\n"
+              "   }"
+          )
+          new_ks_transfer = (
+              "   if (d && s && d != s) {\n"
+              "      ks_set_state(d, s->state, s->fd >= 0 ? dup(s->fd) : -1);\n"
+              "      d->external = s->external;\n"
+              "      d->csf_group = s->csf_group;\n"
+              "      d->csf_seq = s->csf_seq;\n"
+              "      pthread_cond_broadcast(&ks_cond);\n"
+              "   }"
+          )
+          assert old_ks_transfer in src, "Expected ks_transfer block not found"
+          src = src.replace(old_ks_transfer, new_ks_transfer, 1)
 
-      - name: Build Android PanVK driver & package zip
-        env:
-          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
-          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
-        run: |
-          echo "Using NDK: ${{ steps.setup-ndk.outputs.ndk-path }}"
-          chmod +x build.sh
-          ./build.sh "${{ steps.setup-ndk.outputs.ndk-path }}"
+          old_ks_export = (
+              "      if (o->fd >= 0) {\n"
+              "         /* The GPU is still at it: hand out the fence-trigger sync file. */\n"
+              "         *out_fd = dup(o->fd);\n"
+              "         pthread_mutex_unlock(&ks_lock);\n"
+              "         return *out_fd >= 0 ? 0 : ks_ret(-errno);\n"
+              "      }\n"
+              "      /* Submitted without a sync file: all that is left is to wait for the GPU. */\n"
+              "      ret = ks_wait_locked(&handle, 1, deadline, 0, NULL);"
+          )
+          new_ks_export = (
+              "      if (o->fd >= 0) {\n"
+              "         /* The GPU is still at it: hand out the fence-trigger sync file. */\n"
+              "         *out_fd = dup(o->fd);\n"
+              "         pthread_mutex_unlock(&ks_lock);\n"
+              "         return *out_fd >= 0 ? 0 : ks_ret(-errno);\n"
+              "      }\n"
+              "      if (!o->external && o->csf_group && o->csf_seq) {\n"
+              "         struct pan_kmod_kbase_csf_group *csf_g =\n"
+              "            (struct pan_kmod_kbase_csf_group *)o->csf_group;\n"
+              "         const uint64_t csf_seq = o->csf_seq;\n"
+              "         pthread_mutex_unlock(&ks_lock);\n"
+              "         if (!pan_kmod_kbase_csf_wait(csf_g, csf_seq, (int64_t)deadline)) {\n"
+              '            mesa_loge("kbase: sync file export CSF wait timed out (seq %" PRIu64 ")", csf_seq);\n'
+              "            return ks_ret(-ETIME);\n"
+              "         }\n"
+              "         *out_fd = -1;\n"
+              "         return 0;\n"
+              "      }\n"
+              "      /* Submitted without a sync file: all that is left is to wait for the GPU. */\n"
+              "      ret = ks_wait_locked(&handle, 1, deadline, 0, NULL);"
+          )
+          assert old_ks_export in src, "Expected ks_export_sync_file block not found"
+          src = src.replace(old_ks_export, new_ks_export, 1)
 
-      - name: Prepare driver files for single-zip artifact
-        run: |
-          mkdir -p dist/artifact
-          unzip -o dist/*.zip -d dist/artifact
+          # 5b. Watchdog de diagnostico cada 5s si una espera infinita (INT64_MAX) se queda colgada
+          old_ks_wait = (
+              "   const bool all = flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL;\n"
+              "   const bool available = flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE;\n\n"
+              "   for (;;) {"
+          )
+          new_ks_wait = (
+              "   const bool all = flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL;\n"
+              "   const bool available = flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE;\n"
+              "   uint64_t next_log = timeout_nsec == INT64_MAX ? ks_now() + 5000000000ull : 0;\n\n"
+              "   for (;;) {"
+          )
+          assert old_ks_wait in src, "Expected ks_wait_locked head not found"
+          src = src.replace(old_ks_wait, new_ks_wait, 1)
 
-      - name: Upload compiled driver zip
-        uses: actions/upload-artifact@v4
-        with:
-          name: mali-panvk-dimensity7030-fixed
-          path: dist/artifact/
+          old_ks_wait_sleep = (
+              "      if (external) {\n"
+              "         /* An imported sync file signals without telling anyone: look again in a millisecond. */\n"
+              "         const uint64_t next = MIN2((uint64_t)timeout_nsec, ks_now() + 1000000ull);\n"
+              "         const struct timespec ts = {.tv_sec = next / 1000000000ull, .tv_nsec = next % 1000000000ull};\n"
+              "         pthread_cond_timedwait(&ks_cond, &ks_lock, &ts);\n"
+              "      } else if (timeout_nsec == INT64_MAX) {\n"
+              "         pthread_cond_wait(&ks_cond, &ks_lock);\n"
+              "      }"
+          )
+          new_ks_wait_sleep = (
+              "      if (timeout_nsec == INT64_MAX && ks_now() >= next_log) {\n"
+              "         struct ks_obj *o0 = n ? ks_get(handles[0]) : NULL;\n"
+              '         mesa_loge("kbase ks_wait >5s: n=%u done=%u flags=0x%x o0(state=%u ext=%d fd=%d seq=%" PRIu64 ")",\n'
+              "                   n, done, flags, o0 ? (unsigned)o0->state : 255u,\n"
+              "                   o0 ? (int)o0->external : 0, o0 ? o0->fd : -1,\n"
+              "                   o0 ? o0->csf_seq : (uint64_t)0);\n"
+              "         next_log = ks_now() + 5000000000ull;\n"
+              "      }\n"
+              "      if (external) {\n"
+              "         /* An imported sync file signals without telling anyone: look again in a millisecond. */\n"
+              "         const uint64_t next = MIN2((uint64_t)timeout_nsec, ks_now() + 1000000ull);\n"
+              "         const struct timespec ts = {.tv_sec = next / 1000000000ull, .tv_nsec = next % 1000000000ull};\n"
+              "         pthread_cond_timedwait(&ks_cond, &ks_lock, &ts);\n"
+              "      } else if (timeout_nsec == INT64_MAX) {\n"
+              "         const struct timespec ts = {.tv_sec = next_log / 1000000000ull,\n"
+              "                                     .tv_nsec = next_log % 1000000000ull};\n"
+              "         pthread_cond_timedwait(&ks_cond, &ks_lock, &ts);\n"
+              "      }"
+          )
+          assert old_ks_wait_sleep in src, "Expected ks_wait_locked sleep block not found"
+          src = src.replace(old_ks_wait_sleep, new_ks_wait_sleep, 1)
+
+          old_csf_wait = (
+              "bool\n"
+              "pan_kmod_kbase_csf_wait(struct pan_kmod_kbase_csf_group *g, uint64_t seq, int64_t abs_timeout_ns)\n"
+              "{\n"
+              "   struct kbase_csf_dev *c = g->kdev->csfq;\n"
+              "   bool done = false;\n\n"
+              "   pthread_mutex_lock(&c->lock);\n"
+              "   if (!seq)\n"
+              "      seq = g->next_seq - 1;\n"
+              "   for (;;) {\n"
+              "      if (g->done_seq >= seq) {\n"
+              "         done = true;\n"
+              "         break;\n"
+              "      }\n"
+              "      if (abs_ti
