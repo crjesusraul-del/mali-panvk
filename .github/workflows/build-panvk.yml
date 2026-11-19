@@ -229,7 +229,34 @@ jobs:
           s = s[:i] + "int\npan_kmod_kbase_csf_fence_fd(struct pan_kmod_kbase_csf_group *g, uint64_t seq)\n{\n   (void)g; (void)seq; return -1;\n}\n" + s[j:]
 
           p.write_text(s)
-          print("Successfully patched kbase_kmod.c (all 5 patches)")
+
+          # 6. Gralloc Dimensity 7030: forzar linear (SW_READ/WRITE) + layout {17,2,3,4}
+          def rep(path, old, new):
+              fp = Path(path)
+              txt = fp.read_text()
+              assert txt.count(old) == 1, f"{path}: count={txt.count(old)} for {old[:40]!r}"
+              fp.write_text(txt.replace(old, new, 1))
+
+          rep("src/panfrost/vulkan/panvk_android.h",
+              "#define GRALLOC_USAGE_HW_COMPOSER  (1u << 11)",
+              "#define GRALLOC_USAGE_HW_COMPOSER  (1u << 11)\n"
+              "#define PANVK_GRALLOC_SW_READ      (1u << 1)\n"
+              "#define PANVK_GRALLOC_SW_WRITE     (1u << 5)")
+          rep("src/panfrost/vulkan/panvk_android.c",
+              "*grallocUsage |= MALI_GRALLOC_USAGE_NO_AFBC | GRALLOC_USAGE_HW_COMPOSER;",
+              "*grallocUsage |= MALI_GRALLOC_USAGE_NO_AFBC | GRALLOC_USAGE_HW_COMPOSER | PANVK_GRALLOC_SW_READ | PANVK_GRALLOC_SW_WRITE;")
+          rep("src/panfrost/vulkan/panvk_android.c",
+              "      *grallocProducerUsage |= MALI_GRALLOC_USAGE_NO_AFBC;\n"
+              "      *grallocConsumerUsage |= GRALLOC_USAGE_HW_COMPOSER;",
+              "      *grallocProducerUsage |= MALI_GRALLOC_USAGE_NO_AFBC | PANVK_GRALLOC_SW_WRITE;\n"
+              "      *grallocConsumerUsage |= GRALLOC_USAGE_HW_COMPOSER | PANVK_GRALLOC_SW_READ;")
+          rep("src/panfrost/vulkan/panvk_physical_device.c",
+              "MALI_GRALLOC_USAGE_NO_AFBC | GRALLOC_USAGE_HW_COMPOSER;",
+              "MALI_GRALLOC_USAGE_NO_AFBC | GRALLOC_USAGE_HW_COMPOSER | PANVK_GRALLOC_SW_READ | PANVK_GRALLOC_SW_WRITE;")
+          rep("src/util/u_gralloc/u_gralloc_fallback.c",
+              "   {16, 1, 2, 3}, /* MediaTek, Android 17 */",
+              "   {16, 1, 2, 3}, /* MediaTek, Android 17 */\n   {17, 2, 3, 4}, /* MediaTek, Android 15 */")
+          print("Successfully patched kbase_kmod.c + gralloc linear/MTK3 (all 6 patches)")
           PY
 
       - name: Build Android PanVK driver & package zip
